@@ -1,0 +1,170 @@
+function [ErrorTable,KTable,NoOfKTable] = OptimiseK_2(KeepV,Results2)
+% Main optimisation code.
+% Version 1.0.3
+% Last updated: 21st November 2018
+% Connor Taylor
+% University of Leeds
+
+%Current known issues:
+%Parfor loop can become stuck at seemingly random points for an unknown 
+%reason, where one worker is still working and has been for several hours. 
+%What the worker is working on is unknown as you cannot see the work when  
+%the run is paused and has been sent to the worker. Perhaps a 'while' loop
+%would fix this problem: 'while (time of run) < 200 seconds, continue run,
+%else, go to next loop'. 
+
+%Other improvements to be made in a later version:
+%Always improve the x0 by using results from previous optimisations to make
+%further optimisations faster.
+%Add a way to estimate what the upper bound should be.
+%Input 'Time' in a way that does not require editing Reaction_2.
+
+a = struct('A',1,'B',1.5,'C',0,'D',0,'E',0,'F',0); %alphabet struct.
+Conc = [1,1.5,0,0]; %input the starting concentrations here.
+clear Combinations %clear Combinations struct from any previous runs.
+KV = struct('Placeholder',1); %a placeholder struct for K values.
+Combinations = struct('Placeholder',1); %a placeholder struct for all combinations of model terms.
+TotalCombinations = 0; %early definition as a placeholder.
+Counter = 0; %early definition as a placeholder.
+ delete datafile.mat %clear file from previous runs.
+
+for i = 1:size(KeepV,2)
+    %Every single possible combination of the columns are inputted into the
+    %'Combinations' struct.
+    eval(strcat(sprintf('Combinations.Comb%d',i),sprintf(' = nchoosek(1:size(KeepV,2),i);')))
+    TotalCombinations = eval(sprintf('TotalCombinations + size(Combinations.Comb%d,1);',i));
+end
+ 
+%Function which identifies all possible reaction models.
+%Tip: Comment out the function and input 'TotalCombinationsFunctions' and
+%'NumberofKValues' into 'OptimiseK_2' to avoid using this function.
+[TotalCombinationsFunctions,NumberofKValues] = GenerateKineticLaws_2(KeepV,a,TotalCombinations,Combinations,Conc);
+
+try %try operator necessary in case parpool is already open.
+    %parpool(4); %prepare for parfor loop.
+catch
+end
+
+%Number of 'blocks' of 100 to be optimised.
+NumberofFunctionArrays = ceil(TotalCombinations/100);
+
+%Pre-allocate output tables for use in parfor.
+%These can be defined by the use of 'NumberofFunctionArrays', such as:
+%'ErrorTable = zeros(NumberofFunctionArrays,100)'
+%or can be defined by however many optimisations you want to run, such as:
+%'ErrorTable = zeros(150,100)'.
+ ErrorTable = zeros(NumberofFunctionArrays,100);
+ KTable = cell(NumberofFunctionArrays,100);
+ NoOfKTable = zeros(NumberofFunctionArrays,100);
+
+interupt_time_fmincon = 200; %define maximum optimisation time.
+
+%Define output function and fmincon options.
+outputFunction = @(Time,Conc,state)interuptFunfmincon(Time,Conc,state,interupt_time_fmincon);
+options = optimoptions('fmincon','Display','off','OutputFcn',outputFunction,'ConstraintTolerance',1e-10,'OptimalityTolerance',1e-10);
+
+
+%Select the CombNo values you want to evaluate. For all evaluations use
+%'CombNo = 1:NumberofFunctionArrays', or for example use 'CombNo = 23:24'
+%to evaluate 2301-2500 within TotalCombinationsFunctions.
+for CombNo = 1:1
+        try 
+            %If there are less than 100 terms in the last block this will
+            %error, which is why this is in a try operator.
+            %CurrentCombinationsFunctions are the current functions within
+            %the current block to be optimised.
+            CurrentCombinationsFunctions = TotalCombinationsFunctions(((CombNo-1)*100)+1:((CombNo-1)*100)+100,:);
+        catch
+            %This code creates a 100 model block even if there aren't 100
+            %models left.
+            CurrentCombinationsFunctions = cell(100,size(TotalCombinationsFunctions,2));
+            CurrentCombinationsFunctions(:,:) =({'@(KV,a)0'});
+            Remaining = 100-((NumberofFunctionArrays*100)-size(TotalCombinationsFunctions,1));
+            Bulk = size(TotalCombinationsFunctions,1)-Remaining;
+            CurrentCombinationsFunctions(1:Remaining,:) = TotalCombinationsFunctions(Bulk+1:end,:);
+        end
+        
+        
+parfor I = 1:100 %for every model within the block.
+%The number of K values to be optimised is first established, from there
+%the bounds can be established as well as the starting point.
+    try 
+    %This 'try' is necessary for when blocks have less than 100 terms in
+    %them.
+    CurrentNoofKValues = NumberofKValues((CombNo-1)*100+I);
+    catch
+    CurrentNoofKValues = 1;
+    end
+lb = zeros(1,CurrentNoofKValues); %lower bound.
+ub = lb+10; %upper bound. This must be changed for faster reactions.
+x0 = lb;%starting point for local minimiser.
+%Define the function to optimise:
+f = @(input)Reaction_2(input,KV, Results2, KeepV, Conc,a,CurrentCombinationsFunctions,I,TotalCombinations);
+
+ try
+   %Completes the timed optimisation of the current reaction model.
+   tic
+   [x,fval,exitflag,output] = fmincon(f,x0,[],[],[],[],lb,ub,[],options);
+   toc
+   
+   %Compile all information into the relevant tables.
+   ErrorTable(CombNo,I) = fval;
+   KTable{CombNo,I} = num2str(x);
+   NoOfKTable(CombNo,I) = length(x);
+ catch %in case of ODE integration failure.
+   ErrorTable(CombNo,I) = 100;
+   KTable{CombNo,I} = '0';
+   NoOfKTable(CombNo,I) = 100;
+end  
+end
+    %Update user on progress:
+    sprintf('Optimisation block %d of %d completed.',CombNo,NumberofFunctionArrays)
+    %Save current data in case of system failure:
+    save('datafile.mat','ErrorTable','KTable','NoOfKTable');
+end
+
+% %Reshape all of the data in order to use AIC.
+ErrorTable = reshape(ErrorTable',[],1);
+KTable = reshape(KTable',[],1);
+NoOfKTable = reshape(NoOfKTable',[],1);
+% 
+NData = size(Results2,1);
+for i = 1:size(ErrorTable,1)
+    %Calculate AIC for every reaction model.
+    AICraw(i) = NData*(log(ErrorTable(i)/NData))+2*NoOfKTable(i);
+end
+% 
+% %Sort all of the data in descending ranked order:
+[AIC_sorted,AIC_order] = sort(AICraw);
+for i = 1:size(ErrorTable,1)
+    SortedKTable{i} = KTable{AIC_order(i)};
+    SortedErrorTable(i) = ErrorTable(i);
+    SortedNoOfKTable(i) = NoOfKTable(i);
+end
+
+%Last line of code to place a break to keep all of the workspace:
+keyboard
+
+%Version information
+
+%(21/11/18) v1.0.3: Problem of long optimisation times was still occurring,
+%so as well as checking that concentrations do not get too high within
+%'ReactionKineticLaws_2', it is also checked that the concentrations do not
+%give 'NaN' which happens on some iterations of the ODE solver.
+
+%(16/11/18) v1.0.2: Identified the potential issue that caused the
+%optimisation getting stuck. The problem is within the ODE solver for
+%particular reaction models. At given times the concentrations are either
+%NaN or very large (as high as 1e+42) and after each ODE iteration the
+%'Time' is not increasing (when looking at 4 decimal places). The output
+%function is not being called, 'interuptFunODE', during this for an unknown
+%reason - this output function does get called in other optimisations
+%however. 'Algorithm' within fmincon changed back to default. 'TotalConc'
+%added to Reaction_2 and an if statement checking that concentrations do
+%not get too high.
+
+%(15/11/18) v1.0.1: Changed 'Algorithm' in fmincon from the default 'interior-point'
+%to 'sqp'. Sqp is a medium-scale algorithm so should still work for the
+%optimisation which is not a large-scale problem. The reason for this
+%change is to attempt to fix the optimisation getting stuck whilst it has
+%been sent to the workers.
